@@ -10,6 +10,7 @@ import urllib.parse
 from pathlib import Path
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -898,6 +899,23 @@ async def on_error(event: ErrorEvent) -> bool:
     return True
 
 
+async def health(_: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Health server on 0.0.0.0:%s", port)
+    return runner
+
+
 async def main() -> None:
     if not BOT_TOKEN:
         print(
@@ -907,26 +925,32 @@ async def main() -> None:
             "3. Запустите start.bat снова.\n"
         )
         return
+    runner = await start_health_server() if os.getenv("PORT") else None
     db.init(BASE_DIR / "data" / "bot.db")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Главное меню"),
-            BotCommand(command="email", description="Утечки по email"),
-            BotCommand(command="password", description="Проверить пароль"),
-            BotCommand(command="trace", description="Поисковые следы"),
-            BotCommand(command="domain", description="Поддомены домена"),
-            BotCommand(command="cleanup", description="План зачистки"),
-            BotCommand(command="templates", description="Шаблоны заявлений"),
-            BotCommand(command="report", description="Отчёт"),
-            BotCommand(command="help", description="Как это работает"),
-        ]
-    )
-    await bot.delete_webhook(drop_pending_updates=True)
-    log.info("Bot started")
-    await dp.start_polling(bot)
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="email", description="Утечки по email"),
+                BotCommand(command="password", description="Проверить пароль"),
+                BotCommand(command="trace", description="Поисковые следы"),
+                BotCommand(command="domain", description="Поддомены домена"),
+                BotCommand(command="cleanup", description="План зачистки"),
+                BotCommand(command="templates", description="Шаблоны заявлений"),
+                BotCommand(command="report", description="Отчёт"),
+                BotCommand(command="help", description="Как это работает"),
+            ]
+        )
+        await bot.delete_webhook(drop_pending_updates=True)
+        log.info("Bot started")
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        if runner:
+            await runner.cleanup()
 
 
 if __name__ == "__main__":
