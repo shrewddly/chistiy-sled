@@ -916,6 +916,24 @@ async def start_health_server() -> web.AppRunner:
     return runner
 
 
+async def keep_alive() -> None:
+    base = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base:
+        return
+    await asyncio.sleep(60)
+    log.info("Keep-alive enabled for %s", base)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(
+                    base + "/health", timeout=aiohttp.ClientTimeout(total=15)
+                ) as response:
+                    await response.read()
+            except Exception:
+                pass
+            await asyncio.sleep(600)
+
+
 async def main() -> None:
     if not BOT_TOKEN:
         print(
@@ -926,6 +944,7 @@ async def main() -> None:
         )
         return
     runner = await start_health_server() if os.getenv("PORT") else None
+    keepalive = asyncio.create_task(keep_alive()) if os.getenv("RENDER_EXTERNAL_URL") else None
     db.init(BASE_DIR / "data" / "bot.db")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
@@ -948,6 +967,12 @@ async def main() -> None:
         log.info("Bot started")
         await dp.start_polling(bot)
     finally:
+        if keepalive:
+            keepalive.cancel()
+            try:
+                await keepalive
+            except asyncio.CancelledError:
+                pass
         await bot.session.close()
         if runner:
             await runner.cleanup()
