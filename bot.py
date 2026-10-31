@@ -457,6 +457,13 @@ def fmt_email(email: str, data: dict, leak: dict, xon_ok: bool = True) -> str:
     return "\n".join(lines)
 
 
+def clip_text(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    return (text[:cut] if cut > 0 else text[:limit]) + "\n…"
+
+
 def fmt_not_found(email: str, xon_ok: bool = True, leak_ok: bool = True) -> str:
     if xon_ok and leak_ok:
         note = "Ни XposedOrNot, ни LeakCheck совпадений не нашли."
@@ -944,7 +951,7 @@ async def email_input(message: Message, state: FSMContext) -> None:
         db.save_email_check(message.from_user.id, breaches, risk_label, sources)
 
     _email_cache[cache_key] = (time.monotonic(), text_out)
-    await status.edit_text(text_out[:4000], reply_markup=email_result_kb())
+    await status.edit_text(clip_text(text_out), reply_markup=email_result_kb())
 
 
 def email_result_kb() -> InlineKeyboardMarkup:
