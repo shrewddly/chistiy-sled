@@ -10,6 +10,11 @@ USER_AGENT = "ChistiySledBot/2.0 (personal data self-audit)"
 XON_TIMEOUT = aiohttp.ClientTimeout(total=40)
 CRT_TIMEOUT = aiohttp.ClientTimeout(total=90)
 PWNED_TIMEOUT = aiohttp.ClientTimeout(total=20)
+LEAKCHECK_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+_XON_SEM = asyncio.Semaphore(4)
+_CRT_SEM = asyncio.Semaphore(2)
+_LEAKCHECK_SEM = asyncio.Semaphore(4)
 
 DATA_LABELS = {
     "data_Passwords": "Пароли",
@@ -89,18 +94,114 @@ def breach_data_ru(raw: str) -> list[str]:
     return [BREACH_DATA_RU.get(item, item.lower()) for item in items]
 
 
+LEAK_FIELD_RU = {
+    "email": "email",
+    "password": "пароли",
+    "phone": "телефоны",
+    "name": "имена",
+    "first_name": "имена",
+    "last_name": "фамилии",
+    "late_name": "фамилии",
+    "middle_name": "отчество",
+    "username": "логины",
+    "profile_name": "профили",
+    "dob": "даты рождения",
+    "gender": "пол",
+    "address": "адреса",
+    "address1": "адреса",
+    "city": "города",
+    "state": "регионы",
+    "region": "регионы",
+    "area": "районы",
+    "country": "страны",
+    "zip": "индексы",
+    "ip": "IP",
+    "ip1": "IP",
+    "ip2": "IP",
+    "telegram_id": "Telegram ID",
+    "id": "ID",
+    "ssn": "SSN",
+    "qqmail": "QQ",
+    "company_name": "работодатели",
+    "origin": "источники",
+}
+
+
+def leak_field(name: str) -> str:
+    return LEAK_FIELD_RU.get(name.strip().lower(), name.strip().replace("_", " "))
+
+
+def mask_email(email: str) -> str:
+    local, _, domain = email.partition("@")
+    if not domain:
+        return "***"
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}***@{domain}"
+
+
+async def leakcheck(session: aiohttp.ClientSession, query: str) -> dict:
+    url = "https://leakcheck.io/api/public?check=" + urllib.parse.quote(query, safe="")
+    try:
+        async with _LEAKCHECK_SEM:
+            async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=LEAKCHECK_TIMEOUT) as resp:
+                if resp.status == 429:
+                    return {"ok": False, "error": "rate_limit"}
+                if resp.status != 200:
+                    return {"ok": False, "error": f"http_{resp.status}"}
+                try:
+                    data = await resp.json(content_type=None)
+                except ValueError:
+                    return {"ok": False, "error": "bad_json"}
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "timeout"}
+    except aiohttp.ClientError:
+        return {"ok": False, "error": "network"}
+    return _parse_leakcheck(data)
+
+
+def _parse_leakcheck(data: object) -> dict:
+    empty = {"ok": True, "found": 0, "fields": [], "sources": [], "source_count": 0}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "bad_json"}
+    if data.get("success") is False:
+        if str(data.get("error") or "").strip().lower() == "not found":
+            return empty
+        return {"ok": False, "error": "api"}
+    try:
+        found = int(data.get("found") or 0)
+    except (TypeError, ValueError):
+        found = 0
+    fields = [f for f in (data.get("fields") or []) if isinstance(f, str)]
+    sources = []
+    for source in data.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        name = str(source.get("name") or "").strip()
+        if not name:
+            continue
+        sources.append({"name": name, "date": str(source.get("date") or "").strip()})
+    return {
+        "ok": True,
+        "found": found,
+        "fields": fields,
+        "sources": sources[:50],
+        "source_count": len(sources),
+    }
+
+
 async def xon_email(session: aiohttp.ClientSession, email: str) -> dict:
     url = "https://api.xposedornot.com/v1/breach-analytics?email=" + urllib.parse.quote(email, safe="")
     try:
-        async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=XON_TIMEOUT) as resp:
-            if resp.status == 429:
-                return {"ok": False, "error": "rate_limit"}
-            if resp.status != 200:
-                return {"ok": False, "error": f"http_{resp.status}"}
-            try:
-                data = await resp.json(content_type=None)
-            except ValueError:
-                return {"ok": False, "error": "bad_json"}
+        async with _XON_SEM:
+            async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=XON_TIMEOUT) as resp:
+                if resp.status == 429:
+                    return {"ok": False, "error": "rate_limit"}
+                if resp.status != 200:
+                    return {"ok": False, "error": f"http_{resp.status}"}
+                try:
+                    data = await resp.json(content_type=None)
+                except ValueError:
+                    return {"ok": False, "error": "bad_json"}
     except asyncio.TimeoutError:
         return {"ok": False, "error": "timeout"}
     except aiohttp.ClientError:
@@ -188,13 +289,14 @@ async def pwned_password(session: aiohttp.ClientSession, password: str) -> dict:
 async def crt_subdomains(session: aiohttp.ClientSession, domain: str) -> dict:
     url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
     try:
-        async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=CRT_TIMEOUT) as resp:
-            if resp.status != 200:
-                return {"ok": False, "error": f"http_{resp.status}"}
-            try:
-                rows = await resp.json(content_type=None)
-            except ValueError:
-                return {"ok": False, "error": "bad_json"}
+        async with _CRT_SEM:
+            async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=CRT_TIMEOUT) as resp:
+                if resp.status != 200:
+                    return {"ok": False, "error": f"http_{resp.status}"}
+                try:
+                    rows = await resp.json(content_type=None)
+                except ValueError:
+                    return {"ok": False, "error": "bad_json"}
     except asyncio.TimeoutError:
         return {"ok": False, "error": "timeout"}
     except aiohttp.ClientError:

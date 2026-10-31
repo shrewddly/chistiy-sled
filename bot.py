@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import logging
 import os
@@ -38,6 +39,9 @@ from cleanup import CHECKLIST, CONSENT_TEXT
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 WELCOME_IMG = BASE_DIR / "assets" / "welcome.jpg"
+APP_VERSION = "2.0"
+EMAIL_TTL = 600
+EMAIL_CACHE_MAX = 500
 
 
 def load_env(path: Path) -> None:
@@ -63,6 +67,7 @@ _email_cache: dict[tuple[int, str], tuple[float, str]] = {}
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$")
 DOMAIN_RE = re.compile(r"^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+NICK_RE = re.compile(r"^[^\s@]{2,64}$")
 
 RISK_RU = {
     "critical": ("🔴", "критический"),
@@ -106,6 +111,10 @@ class TraceStates(StatesGroup):
     waiting = State()
 
 
+class NickStates(StatesGroup):
+    waiting = State()
+
+
 class DomainStates(StatesGroup):
     waiting = State()
     confirm = State()
@@ -123,6 +132,22 @@ def cooldown_ok(uid: int, action: str = "default", seconds: float = 8.0) -> bool
         return False
     _last_check[key] = now
     return True
+
+
+def prune_caches() -> None:
+    now = time.monotonic()
+    if len(_last_check) > 2000:
+        for key, stamp in list(_last_check.items()):
+            if now - stamp > 3600:
+                _last_check.pop(key, None)
+    for key, (stamp, _) in list(_email_cache.items()):
+        if now - stamp > EMAIL_TTL:
+            _email_cache.pop(key, None)
+    if len(_email_cache) > EMAIL_CACHE_MAX:
+        overflow = len(_email_cache) - EMAIL_CACHE_MAX
+        oldest = sorted(_email_cache.items(), key=lambda item: item[1][0])[:overflow]
+        for key, _ in oldest:
+            _email_cache.pop(key, None)
 
 
 async def say(target: Message | CallbackQuery, text: str, **kwargs) -> None:
@@ -181,7 +206,10 @@ def self_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📧 Утечки по email", callback_data="act:email"),
                 InlineKeyboardButton(text="🔑 Пароль", callback_data="act:password"),
             ],
-            [InlineKeyboardButton(text="🔎 Поисковые следы", callback_data="act:trace")],
+            [
+                InlineKeyboardButton(text="🕵️ Ник", callback_data="act:nick"),
+                InlineKeyboardButton(text="🔎 Поисковые следы", callback_data="act:trace"),
+            ],
             [InlineKeyboardButton(text="🏠 Главная", callback_data="act:home")],
         ]
     )
@@ -212,15 +240,22 @@ async def send_help(target: Message | CallbackQuery) -> None:
         target,
         "ℹ️ <b>Как это работает</b>\n\n"
         "Всё бесплатно:\n"
-        "• email — открытая база XposedOrNot\n"
+        "• email — открытые базы XposedOrNot и LeakCheck\n"
+        "• ник — LeakCheck\n"
         "• пароль — HIBP Pwned Passwords (k-anonymity, сам пароль не отправляется)\n"
         "• домен — публичные CT-логи crt.sh\n\n"
         "Бот работает только с вашими данными и не ищет людей.\n\n"
+        "<b>Что храню</b>\n"
+        "Факт согласия, число утечек и источников, уровень риска, дату проверки и прогресс чек-листа. "
+        "Email не сохраняю. Удалить всё: /delete.\n\n"
         "«Стереть всё» из утечек невозможно: данные из дампов не отзываются. "
         "Чек-лист показывает реальный максимум — сменить доступы, убрать из выдачи, подать заявления.\n\n"
         "Команды не обязательны — всё есть на кнопках.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🏠 Главная", callback_data="act:home")]]
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Удалить мои данные", callback_data="delete:ask")],
+                [InlineKeyboardButton(text="🏠 Главная", callback_data="act:home")],
+            ]
         ),
     )
 
@@ -269,13 +304,15 @@ def report_text(uid: int) -> str:
     done = db.done_items(uid)
     done_count = sum(1 for item in CHECKLIST if item["id"] in done)
     lines = ["📊 <b>Ваш отчёт</b>", ""]
-    if user and user["last_email"]:
+    if user and user["last_check_at"]:
         risk = user["last_risk"]
         _, risk_ru = RISK_RU.get(str(risk or "").lower(), ("", ""))
         risk_text = f" · риск: {risk_ru}" if risk_ru else ""
+        sources = user["last_sources"] or 0
+        sources_text = f" · источников: <b>{sources}</b>" if sources else ""
         lines.append(
-            f"📧 <code>{html.escape(user['last_email'])}</code>\n"
-            f"   Утечек: <b>{user['last_breaches']}</b>{risk_text} · {user['last_check_at']}"
+            f"📧 Последняя проверка email: утечек <b>{user['last_breaches'] or 0}</b>"
+            f"{sources_text}{risk_text}\n   {user['last_check_at']}"
         )
     else:
         lines.append("📧 Email ещё не проверялся")
@@ -285,7 +322,11 @@ def report_text(uid: int) -> str:
         lines.append(f"Следующий шаг: <b>{html.escape(nxt['title'])}</b>")
     else:
         lines.append("✅ Все пункты закрыты.")
-    lines += ["", "Данные из утёкших баз удалить нельзя — можно снизить риск. Пункт 8 в плане."]
+    lines += [
+        "",
+        "Email не сохраняю. Данные из утёкших баз удалить нельзя — можно снизить риск. Пункт 8 в плане.",
+        "Удалить все свои данные: /delete",
+    ]
     return "\n".join(lines)
 
 
@@ -319,47 +360,95 @@ async def send_templates(target: Message | CallbackQuery) -> None:
         await message.answer_document(FSInputFile(path), caption=caption)
 
 
-def fmt_email(email: str, data: dict) -> str:
-    risk = data.get("risk") or {}
-    emoji, risk_ru = RISK_RU.get(str(risk.get("risk_label") or "").lower(), ("⚪", "неизвестен"))
-    score = risk.get("risk_score")
-    risk_line = f"{emoji} Риск: <b>{risk_ru}</b>" + (f" · {score}/100" if isinstance(score, int) else "")
-    total = len(data["sites"]) or len(data["details"])
-    pastes = data.get("pastes") or 0
-
+def leakcheck_block(leak: dict, title: str = "Дополнительно · LeakCheck") -> list[str]:
+    if not leak or not leak.get("found"):
+        return []
+    sources = leak.get("sources") or []
+    source_count = leak.get("source_count", len(sources))
+    fields: list[str] = []
+    for field in leak.get("fields") or []:
+        name = checks.leak_field(field)
+        if name and name not in fields:
+            fields.append(name)
+        if len(fields) >= 8:
+            break
     lines = [
-        "🔓 <b>Утечки найдены</b>",
-        f"<code>{html.escape(email)}</code>",
         "",
-        risk_line,
-        f"Утечек: <b>{total}</b>" + (f" · паст: {pastes}" if pastes else ""),
-        "",
+        f"<b>{title}</b>",
+        f"Записей в базах: <b>{leak['found']}</b> · источников: <b>{source_count}</b>",
     ]
-    exposed = data.get("exposed") or []
-    if exposed:
-        lines.append("<b>Что утекло</b>")
-        for name, value in exposed[:8]:
-            lines.append(f"• {html.escape(name)} — {value}")
-        if len(exposed) > 8:
-            lines.append(f"…и ещё {len(exposed) - 8} категорий")
-        lines.append("")
-    details = sorted(
-        data["details"],
-        key=lambda d: (str(d.get("verified")) == "Yes", str(d.get("xposed_date") or "")),
-        reverse=True,
-    )
-    if details:
-        lines.append("<b>Крупные утечки</b>")
-        for item in details[:4]:
-            name = html.escape(str(item.get("breach") or "—"))
-            year = html.escape(str(item.get("xposed_date") or ""))
-            tail = ", ".join(checks.breach_data_ru(str(item.get("xposed_data") or ""))[:4])
-            line = f"• <b>{name}</b>" + (f" · {year}" if year else "")
-            if tail:
-                line += f"\n  {html.escape(tail)}"
-            lines.append(line)
-        lines.append("")
+    if fields:
+        lines.append("Что встречается: " + ", ".join(html.escape(name) for name in fields))
+    if sources:
+        shown = []
+        for source in sources[:6]:
+            name = html.escape(source["name"])
+            date = source.get("date") or ""
+            shown.append(f"{name} ({html.escape(date)})" if date else name)
+        lines.append("Источники: " + ", ".join(shown))
+        if source_count > 6:
+            lines.append(f"…и ещё {source_count - 6}.")
+    return lines
+
+
+def xon_breach_count(data: dict) -> int:
+    return len(data.get("sites") or []) or len(data.get("details") or [])
+
+
+def fmt_email(email: str, data: dict, leak: dict, xon_ok: bool = True) -> str:
+    found = bool(data.get("found"))
+    if found:
+        risk = data.get("risk") or {}
+        emoji, risk_ru = RISK_RU.get(str(risk.get("risk_label") or "").lower(), ("⚪", "неизвестен"))
+        score = risk.get("risk_score")
+        risk_line = f"{emoji} Риск: <b>{risk_ru}</b>" + (f" · {score}/100" if isinstance(score, int) else "")
+        pastes = data.get("pastes") or 0
+        lines = [
+            "🔓 <b>Утечки найдены</b>",
+            f"<code>{checks.mask_email(email)}</code>",
+            "",
+            risk_line,
+            f"Утечек: <b>{xon_breach_count(data)}</b>" + (f" · паст: {pastes}" if pastes else ""),
+            "",
+        ]
+        exposed = data.get("exposed") or []
+        if exposed:
+            lines.append("<b>Что утекло</b>")
+            for name, value in exposed[:8]:
+                lines.append(f"• {html.escape(name)} — {value}")
+            if len(exposed) > 8:
+                lines.append(f"…и ещё {len(exposed) - 8} категорий")
+            lines.append("")
+        details = sorted(
+            data["details"],
+            key=lambda d: (str(d.get("verified")) == "Yes", str(d.get("xposed_date") or "")),
+            reverse=True,
+        )
+        if details:
+            lines.append("<b>Крупные утечки</b>")
+            for item in details[:4]:
+                name = html.escape(str(item.get("breach") or "—"))
+                year = html.escape(str(item.get("xposed_date") or ""))
+                tail = ", ".join(checks.breach_data_ru(str(item.get("xposed_data") or ""))[:4])
+                line = f"• <b>{name}</b>" + (f" · {year}" if year else "")
+                if tail:
+                    line += f"\n  {html.escape(tail)}"
+                lines.append(line)
+            lines.append("")
+    else:
+        note = "⚠️ XposedOrNot сейчас недоступен — ниже данные LeakCheck." if not xon_ok else "XposedOrNot: совпадений нет."
+        lines = [
+            "🔓 <b>Найдены записи в утечках</b>",
+            f"<code>{checks.mask_email(email)}</code>",
+            "",
+            note,
+        ]
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    lines.extend(leakcheck_block(leak))
     lines += [
+        "",
         "<b>Что делать</b>",
         "1. Смените пароль от этой почты и от всех сервисов, где он повторялся.",
         "2. Включите 2FA.",
@@ -368,13 +457,48 @@ def fmt_email(email: str, data: dict) -> str:
     return "\n".join(lines)
 
 
-def fmt_not_found(email: str) -> str:
+def fmt_not_found(email: str, xon_ok: bool = True, leak_ok: bool = True) -> str:
+    if xon_ok and leak_ok:
+        note = "Ни XposedOrNot, ни LeakCheck совпадений не нашли."
+    else:
+        unavailable = []
+        if not xon_ok:
+            unavailable.append("XposedOrNot")
+        if not leak_ok:
+            unavailable.append("LeakCheck")
+        note = "Проверка неполная: " + ", ".join(unavailable) + " сейчас недоступен."
     return (
         "✅ <b>Утечек не найдено</b>\n"
-        f"<code>{html.escape(email)}</code>\n\n"
-        "Хороший знак, но не гарантия: базы покрывают не всё. "
+        f"<code>{checks.mask_email(email)}</code>\n\n"
+        f"{note} Хороший знак, но не гарантия: базы покрывают не всё. "
         "Проверьте пароли и пройдите план зачистки."
     )
+
+
+def fmt_nick(nick: str, leak: dict, ok: bool = True) -> str:
+    if not ok:
+        return "LeakCheck сейчас недоступен. Попробуйте через пару минут."
+    if not leak.get("found"):
+        return (
+            "✅ <b>Ник в утечках не найден</b>\n"
+            f"<code>{html.escape(nick)}</code>\n\n"
+            "Это не гарантия: база покрывает не все источники. Не используйте один ник и пароль везде."
+        )
+    lines = [
+        "🕵️ <b>Ник найден в утечках</b>",
+        f"<code>{html.escape(nick)}</code>",
+    ]
+    lines.extend(leakcheck_block(leak, "LeakCheck"))
+    lines += [
+        "",
+        "<b>Что делать</b>",
+        "1. Смените пароль на сервисах, где использовался этот ник.",
+        "2. Включите 2FA.",
+        "3. Закройте профили, где ник виден посторонним.",
+        "",
+        "LeakCheck показывает только источники и категории данных, без самих записей.",
+    ]
+    return "\n".join(lines)
 
 
 def fmt_domain(domain: str, names: list[str]) -> str:
@@ -420,11 +544,26 @@ async def start_password(target: Message | CallbackQuery, state: FSMContext) -> 
     await say(
         target,
         "🔑 <b>Проверка пароля</b>\n\n"
-        "Отправьте пароль одним сообщением — я сразу удалю его из чата и проверю по базе утечек. "
-        "Нигде не сохраняется.\n\n"
-        "Если это пароль от почты или банка — не рискуйте, используйте файл "
-        "<code>tools\\check_password.bat</code> в папке бота.\n\n"
+        "⚠️ Telegram хранит историю переписки. Не отправляйте сюда пароль от почты, банка или Госуслуг — "
+        "для важных паролей используйте проверку в браузере, пароль там не покидает устройство.\n\n"
+        "Сюда можно отправить тестовый или старый пароль. Я сразу удалю сообщение из чата и нигде его не сохраню.\n\n"
         "Проверка бесплатная. /cancel — отмена.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔒 Безопасная проверка на HIBP", url="https://haveibeenpwned.com/Passwords")]
+            ]
+        ),
+    )
+
+
+async def start_nick(target: Message | CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(NickStates.waiting)
+    await say(
+        target,
+        "🕵️ <b>Проверка ника</b>\n\n"
+        "Пришлите ваш ник или логин — поищу в открытой базе LeakCheck. "
+        "Проверяйте только свой ник: это самопроверка, а не поиск людей.\n\n"
+        "Обычно 5–15 секунд. /cancel — отмена.",
     )
 
 
@@ -462,6 +601,28 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
     await send_help(message)
 
 
+async def ask_delete(target: Message | CallbackQuery) -> None:
+    await say(
+        target,
+        "🗑 <b>Удалить все ваши данные?</b>\n\n"
+        "Сотру согласие, отчёт о проверке и прогресс чек-листа. "
+        "Email я и так не сохраняю.\n\n"
+        "Это необратимо — начать заново можно будет через /start.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Да, удалить", callback_data="delete:yes")],
+                [InlineKeyboardButton(text="Отмена", callback_data="delete:no")],
+            ]
+        ),
+    )
+
+
+@router.message(Command("delete"))
+async def cmd_delete(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await ask_delete(message)
+
+
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -480,6 +641,13 @@ async def cmd_password(message: Message, state: FSMContext) -> None:
     await state.clear()
     if await require_consent(message):
         await start_password(message, state)
+
+
+@router.message(Command("nick"))
+async def cmd_nick(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if await require_consent(message):
+        await start_nick(message, state)
 
 
 @router.message(Command("trace"))
@@ -581,6 +749,36 @@ async def cb_consent_no(call: CallbackQuery) -> None:
     await call.answer()
 
 
+@router.callback_query(F.data == "delete:ask")
+async def cb_delete_ask(call: CallbackQuery) -> None:
+    await ask_delete(call)
+    await call.answer()
+
+
+@router.callback_query(F.data == "delete:yes")
+async def cb_delete_yes(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    db.delete_user(call.from_user.id)
+    text = (
+        "🗑 <b>Данные удалены</b>\n\n"
+        "Согласие, отчёт и чек-лист стёрты. Начать заново: /start."
+    )
+    try:
+        await call.message.edit_text(text)
+    except TelegramBadRequest:
+        await call.message.answer(text)
+    await call.answer("Удалено")
+
+
+@router.callback_query(F.data == "delete:no")
+async def cb_delete_no(call: CallbackQuery) -> None:
+    try:
+        await call.message.edit_text("Ок, ничего не удалял.")
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
 @router.callback_query(F.data == "act:home")
 async def cb_home(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -615,6 +813,15 @@ async def cb_password(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     await state.clear()
     await start_password(call, state)
+
+
+@router.callback_query(F.data == "act:nick")
+async def cb_nick(call: CallbackQuery, state: FSMContext) -> None:
+    if not await require_consent(call):
+        return
+    await call.answer()
+    await state.clear()
+    await start_nick(call, state)
 
 
 @router.callback_query(F.data == "act:trace")
@@ -693,38 +900,48 @@ async def email_input(message: Message, state: FSMContext) -> None:
     if not EMAIL_RE.match(text) or len(text) > 254:
         await message.answer("Это не похоже на email. Пример: name@example.com. Ещё раз или /cancel.")
         return
-    await state.clear()
     if not cooldown_ok(message.from_user.id, "email", 20):
-        await message.answer("Слишком часто — подождите пару секунд и попробуйте снова.")
+        await message.answer("Слишком часто — подождите пару секунд и отправьте email снова.")
         return
+    await state.clear()
+    prune_caches()
 
-    cache_key = (message.from_user.id, text)
+    cache_key = (message.from_user.id, hashlib.sha256(text.encode("utf-8")).hexdigest())
     cached = _email_cache.get(cache_key)
-    if cached and time.monotonic() - cached[0] < 600:
+    if cached and time.monotonic() - cached[0] < EMAIL_TTL:
         await message.answer(cached[1], reply_markup=email_result_kb())
         return
 
-    status = await message.answer("Проверяю утечки…")
+    status = await message.answer("Проверяю утечки в двух базах… Обычно 5–20 секунд.")
     async with aiohttp.ClientSession() as session:
-        result = await checks.xon_email(session, text)
-    if not result["ok"]:
-        errors = {
-            "rate_limit": "База сейчас ограничивает запросы. Подождите минуту и попробуйте снова.",
-            "timeout": "База не ответила вовремя. Попробуйте позже.",
-            "network": "Сетевая ошибка. Попробуйте позже.",
-        }
-        await status.edit_text(errors.get(result["error"], f"Сервис вернул ошибку ({html.escape(result['error'])})."))
+        xon_res, leak_res = await asyncio.gather(
+            checks.xon_email(session, text),
+            checks.leakcheck(session, text),
+            return_exceptions=True,
+        )
+    if not isinstance(xon_res, dict):
+        xon_res = {"ok": False, "error": "network"}
+    if not isinstance(leak_res, dict):
+        leak_res = {"ok": False, "error": "network"}
+    xon_ok = bool(xon_res.get("ok"))
+    leak_ok = bool(leak_res.get("ok"))
+
+    if not xon_ok and not leak_ok:
+        await status.edit_text("Обе базы сейчас недоступны. Попробуйте через минуту.")
         return
 
-    if result["found"]:
-        text_out = fmt_email(text, result)
-        risk = result.get("risk") or {}
-        risk_label = str(risk.get("risk_label") or "").lower() or None
-        breaches = len(result["sites"]) or len(result["details"])
-        db.save_email_check(message.from_user.id, text, breaches, risk_label)
+    xon_found = xon_ok and bool(xon_res.get("found"))
+    leak_found = leak_ok and bool(leak_res.get("found"))
+    if not xon_found and not leak_found:
+        text_out = fmt_not_found(text, xon_ok, leak_ok)
+        db.save_email_check(message.from_user.id, 0, None, 0)
     else:
-        text_out = fmt_not_found(text)
-        db.save_email_check(message.from_user.id, text, 0, None)
+        text_out = fmt_email(text, xon_res, leak_res, xon_ok)
+        risk = xon_res.get("risk") or {}
+        risk_label = str(risk.get("risk_label") or "").lower() or None
+        breaches = xon_breach_count(xon_res) if xon_found else 0
+        sources = int(leak_res.get("source_count") or 0) if leak_found else 0
+        db.save_email_check(message.from_user.id, breaches, risk_label, sources)
 
     _email_cache[cache_key] = (time.monotonic(), text_out)
     await status.edit_text(text_out[:4000], reply_markup=email_result_kb())
@@ -793,6 +1010,37 @@ async def password_input(message: Message, state: FSMContext) -> None:
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🧹 План зачистки", callback_data="act:cleanup")],
+                [InlineKeyboardButton(text="🏠 Главная", callback_data="act:home")],
+            ]
+        ),
+    )
+
+
+@router.message(NickStates.waiting)
+async def nick_input(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Ок, отменил. Выберите раздел кнопкой ниже 👇", reply_markup=nav_kb())
+        return
+    if not NICK_RE.match(text):
+        await message.answer("Ник должен быть от 2 до 64 символов, без пробелов и @. Ещё раз или /cancel.")
+        return
+    if not cooldown_ok(message.from_user.id, "nick", 20):
+        await message.answer("Слишком часто — подождите пару секунд и отправьте ник снова.")
+        return
+    await state.clear()
+    status = await message.answer("Проверяю ник в базе LeakCheck…")
+    async with aiohttp.ClientSession() as session:
+        result = await checks.leakcheck(session, text)
+    if not result["ok"]:
+        await status.edit_text("LeakCheck сейчас недоступен. Попробуйте через пару минут.")
+        return
+    await status.edit_text(
+        fmt_nick(text, result),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📧 Утечки по email", callback_data="act:email")],
                 [InlineKeyboardButton(text="🏠 Главная", callback_data="act:home")],
             ]
         ),
@@ -896,11 +1144,21 @@ async def fallback(message: Message) -> None:
 @router.errors()
 async def on_error(event: ErrorEvent) -> bool:
     log.error("Unhandled error: %s", event.exception, exc_info=event.exception)
+    try:
+        update = event.update
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Что-то пошло не так. Попробуйте ещё раз.", show_alert=True
+            )
+        elif update.message:
+            await update.message.answer("Что-то пошло не так. Попробуйте ещё раз.")
+    except Exception:
+        pass
     return True
 
 
 async def health(_: web.Request) -> web.Response:
-    return web.Response(text="ok")
+    return web.Response(text=f"ok {APP_VERSION}")
 
 
 async def start_health_server() -> web.AppRunner:
@@ -955,11 +1213,13 @@ async def main() -> None:
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="email", description="Утечки по email"),
                 BotCommand(command="password", description="Проверить пароль"),
+                BotCommand(command="nick", description="Утечки по нику"),
                 BotCommand(command="trace", description="Поисковые следы"),
                 BotCommand(command="domain", description="Поддомены домена"),
                 BotCommand(command="cleanup", description="План зачистки"),
                 BotCommand(command="templates", description="Шаблоны заявлений"),
                 BotCommand(command="report", description="Отчёт"),
+                BotCommand(command="delete", description="Удалить мои данные"),
                 BotCommand(command="help", description="Как это работает"),
             ]
         )

@@ -23,6 +23,7 @@ def init(path: Path) -> None:
                 last_email TEXT,
                 last_breaches INTEGER,
                 last_risk TEXT,
+                last_sources INTEGER,
                 last_check_at TEXT
             );
             CREATE TABLE IF NOT EXISTS checklist (
@@ -37,6 +38,9 @@ def init(path: Path) -> None:
         columns = {row[1] for row in _conn.execute("PRAGMA table_info(users)")}
         if "last_risk" not in columns:
             _conn.execute("ALTER TABLE users ADD COLUMN last_risk TEXT")
+        if "last_sources" not in columns:
+            _conn.execute("ALTER TABLE users ADD COLUMN last_sources INTEGER")
+        _conn.execute("UPDATE users SET last_email = NULL WHERE last_email IS NOT NULL")
         _conn.commit()
 
 
@@ -62,13 +66,24 @@ def set_consent(user_id: int, value: bool) -> None:
         _conn.commit()
 
 
-def save_email_check(user_id: int, email: str, breaches: int, risk: str | None = None) -> None:
+def save_email_check(user_id: int, breaches: int, risk: str | None = None, sources: int = 0) -> None:
     ensure_user(user_id)
     with _lock:
         _conn.execute(
-            "UPDATE users SET last_email = ?, last_breaches = ?, last_risk = ?, last_check_at = ? WHERE user_id = ?",
-            (email, breaches, risk, _now(), user_id),
+            """
+            UPDATE users
+            SET last_email = NULL, last_breaches = ?, last_risk = ?, last_sources = ?, last_check_at = ?
+            WHERE user_id = ?
+            """,
+            (breaches, risk, sources, _now(), user_id),
         )
+        _conn.commit()
+
+
+def delete_user(user_id: int) -> None:
+    with _lock:
+        _conn.execute("DELETE FROM checklist WHERE user_id = ?", (user_id,))
+        _conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         _conn.commit()
 
 
